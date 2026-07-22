@@ -1,0 +1,462 @@
+import tensorflow as tf
+import numpy as np
+import scipy.io as sio
+from model import KGCN
+import os
+
+
+def train_n_runs(args, data, show_loss, show_topk, show_ctr):
+    global user_sequences  # Add this line
+    n_user, n_item, n_entity, n_relation = data[0], data[1], data[2], data[3]
+    train_data, eval_data, test_data = data[4], data[5], data[6]
+    adj_entity, adj_relation = data[7], data[8]
+    user_item_adj = data[9]
+    user_sequences = data[10]  # NEW: Add this line
+
+    auc = []
+    f1_score = []
+    precision = []
+    recall = []
+    epochs_auc = []
+    epochs_recall = []
+    train_losses = []  # New: To store the loss values
+
+
+
+    RUNS = args.runs
+
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_id)
+
+    ckpt_save_path_1 = '../Pretrain/{}/{}/ctr/'.format(args.model_type, args.dataset)
+    ckpt_save_path_2 = '../Pretrain/{}/{}/topk/'.format(args.model_type, args.dataset)
+
+    if not os.path.exists(ckpt_save_path_1):
+        os.makedirs(ckpt_save_path_1)
+    if not os.path.exists(ckpt_save_path_2):
+        os.makedirs(ckpt_save_path_2)
+
+    if args.pretrain == 1:
+        user_emb = np.load('../output/KGCN_{}_user_emb.npy'.format(args.dataset))
+        entity_emb = np.load('../output/KGCN_{}_entity_emb.npy'.format(args.dataset))
+        relation_emb = np.load('../output/KGCN_{}_relation_emb.npy'.format(args.dataset))
+        pretrain = {'user': user_emb, 'entity': entity_emb, 'relation': relation_emb}
+    else:
+        pretrain = None
+
+    args.seed += 1
+    print('----------')
+    print(args.seed)
+    print('----------')
+
+    for r in range(RUNS):
+        tf.compat.v1.reset_default_graph()
+
+        model = KGCN(args, n_user, n_item, n_entity, n_relation, adj_entity, adj_relation, user_item_adj, user_sequences, pretrain=pretrain)
+
+        saver_ckpt = tf.compat.v1.train.Saver()
+
+        best_auc = 0
+        best_f1 = 0
+        best_recall = None
+        best_precision = None
+
+        best_auc_epoch = 0
+        best_recall_epoch = 0
+
+        best_auc_eval = 0
+        best_r10_eval = 0
+
+        user_list_eval, train_record_eval, test_record_eval, \
+            item_set_eval, k_list_eval = topk_settings(show_topk, train_data, eval_data, n_item, seed=args.seed)
+        args.seed += 1
+
+        user_list_test, train_record_test, test_record_test, \
+            item_set_test, k_list_test = topk_settings(show_topk, train_data, test_data, n_item, seed=args.seed)
+        args.seed += 1
+
+        config = tf.compat.v1.ConfigProto()
+        config.gpu_options.allow_growth = True
+        with tf.compat.v1.Session(config=config) as sess:
+            sess.run(tf.compat.v1.global_variables_initializer())
+
+            if not (args.logging == 'save'):
+                ckpt = tf.train.get_checkpoint_state(os.path.dirname(ckpt_restore_path + 'checkpoint'))
+                if ckpt and ckpt.model_checkpoint_path:
+                    saver_ckpt.restore(sess, ckpt.model_checkpoint_path)
+                    print('================Done loading======================')
+            else:
+                print('Initialized from scratch')
+
+            for step in range(args.n_epochs):
+                np.random.shuffle(train_data)
+                start = 0
+
+                epoch_train_loss = []  # New: To store the loss for each epoch
+                epoch_seq_loss = []  # NEW
+
+                while start + args.batch_size <= train_data.shape[0]:
+                    _, loss = model.train(sess, get_feed_dict(args, model, train_data, user_sequences, start, start + args.batch_size))
+                    epoch_train_loss.append(loss)
+                    
+                    # Get sequential loss separately if needed
+                    if args.use_temporal:
+                        seq_loss_val = sess.run(model.seq_loss, get_feed_dict(args, model, train_data, user_sequences, start, start + args.batch_size))
+                        epoch_seq_loss.append(seq_loss_val)
+                    
+                    start += args.batch_size
+
+                avg_train_loss = np.mean(epoch_train_loss)
+                
+                if args.use_temporal and len(epoch_seq_loss) > 0:
+                    avg_seq_loss = np.mean(epoch_seq_loss)
+                    print('epoch %d    train_loss: %.4f    seq_loss: %.4f' % (step, avg_train_loss, avg_seq_loss))
+                else:
+                    print('epoch %d    train_loss: %.4f' % (step, avg_train_loss))
+
+                #     start += args.batch_size
+                #     if show_loss:
+                #         print(start, loss)
+
+                # avg_train_loss = np.mean(epoch_train_loss)  #  Calculate the average loss for the epoch
+                # print('epoch %d    train_loss: %.4f' % (step, avg_train_loss))  # New: Print the average loss
+
+                train_losses.append(avg_train_loss)  # Store the average loss
+
+                with open('../result/{}_{}_train_loss_{}.txt'.format(args.model_type, args.dataset, args.att), 'w') as f:
+                    for index, avg_train_loss in enumerate(train_losses):
+                        f.write('epoch:{:2d} train_loss:{:.4f}\n'.format(index, avg_train_loss))
+
+                if show_ctr:
+                    # train_auc, train_f1 = ctr_eval(args, sess, model, train_data, args.batch_size)
+                    # eval_auc, eval_f1 = ctr_eval(args, sess, model, eval_data, args.batch_size)
+                    # test_auc, test_f1 = ctr_eval(args, sess, model, test_data, args.batch_size)
+                    train_auc, train_f1 = ctr_eval(args, sess, model, train_data, user_sequences, args.batch_size)
+                    eval_auc, eval_f1 = ctr_eval(args, sess, model, eval_data, user_sequences, args.batch_size)
+                    test_auc, test_f1 = ctr_eval(args, sess, model, test_data, user_sequences, args.batch_size)
+
+                    print('epoch %d    train auc: %.4f  f1: %.4f    eval auc: %.4f  f1: %.4f    test auc: %.4f  f1: %.4f'
+                          % (step, train_auc, train_f1, eval_auc, eval_f1, test_auc, test_f1))
+
+                    eval_logging_ctr(args, step, train_auc, train_f1, eval_auc, eval_f1, test_auc, test_f1)
+                    if eval_auc > best_auc_eval:
+                        best_auc_epoch = step
+                        best_auc_eval = eval_auc
+                        best_auc = test_auc
+                        best_f1 = test_f1
+
+                        user_embedding, entity_embedding, relation_embedding = model.get_embeddings(sess)
+                        sio.savemat('../output/{}_{}_emb.mat'.format(args.model_type, args.dataset), \
+                            {'user': user_embedding, 'entity': entity_embedding, 'relation': relation_embedding})
+                        np.save('../output/{}_{}_user_emb.npy'.format(args.model_type, args.dataset), user_embedding)
+                        np.save('../output/{}_{}_entity_emb.npy'.format(args.model_type, args.dataset), entity_embedding)
+                        np.save('../output/{}_{}_relation_emb.npy'.format(args.model_type, args.dataset), relation_embedding)
+
+                if show_topk:
+                    eval_precision, eval_recall = topk_eval(
+                        args, sess, model, user_list_eval, train_record_eval, test_record_eval, item_set_eval, k_list_eval, args.batch_size)
+                    test_precision, test_recall = topk_eval(
+                        args, sess, model, user_list_test, train_record_test, test_record_test, item_set_test, k_list_test, args.batch_size)
+
+                    eval_logging_topk(args, step, eval_precision, eval_recall, test_precision, test_recall)
+                    if eval_recall[3] > best_r10_eval:
+                        best_recall_epoch = step
+                        best_r10_eval = eval_recall[3]
+                        best_recall = test_recall
+                        best_precision = test_precision
+
+        if show_ctr:
+            auc.append(best_auc)
+            f1_score.append(best_f1)
+            recall.append(best_recall)
+            precision.append(best_precision)
+
+        if show_topk:
+            epochs_recall.append(best_recall_epoch)
+            epochs_auc.append(best_auc_epoch)
+
+    if show_ctr and show_topk:
+        auc = np.array(auc)
+        f1_score = np.array(f1_score)
+        recall = np.array(recall)
+        precision = np.array(precision)
+
+        print(auc)
+        print(f1_score)
+        print(recall)
+        print(precision)
+
+        printings_auc = 'average auc: {:.4f}+\\-{:.4f}'.format(np.mean(auc), np.std(auc))
+        printings_f1 = 'average f1 : {:.4f}+\\-{:.4f}'.format(np.mean(f1_score), np.std(f1_score))
+
+        printings_recall = 'average recall   : '
+        for i in range(len(k_list_test)):
+            printings_recall = printings_recall + '{:.4f}+\\-{:.4f} '.format(np.mean(recall[:, i]), np.std(recall[:, i]))
+        printings_precision = 'average precision: '
+        for i in range(len(k_list_test)):
+            printings_precision = printings_precision + '{:.4f}+\\-{:.4f} '.format(np.mean(precision[:, i]), np.std(precision[:, i]))
+
+        print(printings_auc)
+        print(printings_f1)
+        print(printings_recall)
+        print(printings_precision)
+
+        logging_final(args, printings_auc, printings_f1, printings_recall, printings_precision)
+    print("average train_Loss", np.mean(train_losses))  # New: Print average losses after training
+
+'''
+***********************************************
+logging functions
+'''
+def logging_final(args, auc, f1_score, recall, precision):
+    fid = open('../result/{}_{}_{}.txt'.format(args.model_type, args.dataset, args.att), 'a')
+
+    fid.write('\n******************************************************************************\n')
+    params = eval(args.params)
+    settings = ''
+    for i in range(len(params)):
+        settings = settings + params[i] + ':{} '.format(eval('args.'+params[i]))
+    fid.write(settings+'\n')
+    fid.write('******************************************************************************\n')
+
+    fid.write(auc+'\n')
+    fid.write(f1_score+'\n')
+    fid.write(recall+'\n')
+    fid.write(precision+'\n')
+
+    fid.close()
+
+
+def eval_logging_topk(args, epoch, eval_pr, eval_re, test_pr, test_re):
+    fid = open('../result/{}_{}_topk_{}.txt'.format(args.model_type, args.dataset, args.att), 'a')
+
+    if epoch == 0:
+        fid.write('\n******************************************************************************\n')
+        params = eval(args.params)
+        settings = ''
+        for i in range(len(params)):
+            settings = settings + params[i] + ':{} '.format(eval('args.'+params[i]))
+        fid.write(settings+'\n')
+        fid.write('******************************************************************************\n')
+
+    result_type = ['epoch:{:2d} eval precision: '.format(epoch), 'eval recall: '.format(epoch),
+                   'epoch:{:2d} test precision: '.format(epoch), 'test recall: '.format(epoch)]
+    results = [eval_pr, eval_re, test_pr, test_re]
+    for i, result in enumerate(results):
+        printings = result_type[i]
+        for j in result:
+            printings = printings + '{:.4f}\t'.format(j)
+        fid.write(printings)
+        if i == 1 or i == 3:
+            fid.write('\n')
+    fid.write('\n')
+    fid.close()
+
+def eval_logging_ctr(args, epoch, train_auc, train_f1, eval_auc, eval_f1, test_auc, test_f1):
+    fid = open('../result/{}_{}_ctr_{}.txt'.format(args.model_type, args.dataset, args.att), 'a')
+
+    if epoch == 0:
+        fid.write('\n******************************************************************************\n')
+        params = eval(args.params)
+        settings = ''
+        for i in range(len(params)):
+            settings = settings + params[i] + ':{} '.format(eval('args.'+params[i]))
+        fid.write(settings+'\n')
+        fid.write('******************************************************************************\n')
+
+    fid.write('epoch:{:2d} train_auc:{:.4f} train_f1:{:.4f} '.format(epoch, train_auc, train_f1) +
+              'eval_auc:{:.4f} eval_f1:{:.4f} '.format(eval_auc, eval_f1) +
+              'test_auc:{:.4f} test_f1:{:.4f}\n'.format(test_auc, test_f1))
+
+    fid.close()
+'''
+***********************************************
+'''
+
+def topk_settings(show_topk, train_data, test_data, n_item, seed=555):
+    np.random.seed(seed)
+    if show_topk:
+        user_num = 100
+        k_list = [1, 2, 5, 10, 20, 50, 100]
+        train_record = get_user_record(train_data, True)
+        test_record = get_user_record(test_data, False)
+        user_list = list(set(train_record.keys()) & set(test_record.keys()))
+        if len(user_list) > user_num:
+            user_list = np.random.choice(user_list, size=user_num, replace=False)
+        item_set = set(list(range(n_item)))
+        return user_list, train_record, test_record, item_set, k_list
+    else:
+        return [None] * 5
+
+
+def get_feed_dict(args, model, data, user_sequences, start, end, flag=True):
+    """
+    Updated feed_dict with temporal sequence information
+    """
+    batch_users = data[start:end, 0]
+    batch_items = data[start:end, 1]
+    batch_labels = data[start:end, 2]
+    # NEW: Prepare sequence data
+    batch_seq_items, batch_seq_timestamps, batch_seq_positions, batch_seq_lengths = \
+        prepare_sequence_batch(batch_users, user_sequences, model.max_seq_length)
+    if flag:
+        feed_dict = {model.user_indices: batch_users,
+                     model.item_indices: batch_items,
+                     model.labels: batch_labels,
+                     model.user_seq_items: batch_seq_items,
+                     model.user_seq_timestamps: batch_seq_timestamps,
+                     model.user_seq_positions: batch_seq_positions,
+                     model.user_seq_length: batch_seq_lengths,
+                     model.node_dropout: eval(args.node_dropout),
+                     model.mess_dropout: eval(args.mess_dropout)}
+    else:
+        feed_dict = {model.user_indices: batch_users,
+                     model.item_indices: batch_items,
+                     model.labels: batch_labels,
+                     model.user_seq_items: batch_seq_items,
+                     model.user_seq_timestamps: batch_seq_timestamps,
+                     model.user_seq_positions: batch_seq_positions,
+                     model.user_seq_length: batch_seq_lengths,
+                     model.node_dropout: [0.]*len(eval(args.layer_size)),
+                     model.mess_dropout: [0.]*len(eval(args.layer_size))}
+    return feed_dict
+
+def prepare_sequence_batch(batch_users, user_sequences, max_seq_length):
+    """
+    Prepare sequence data for a batch of users
+    """
+    batch_size = len(batch_users)
+    batch_seq_items = np.zeros((batch_size, max_seq_length), dtype=np.int64)
+    batch_seq_timestamps = np.zeros((batch_size, max_seq_length), dtype=np.float32)
+    batch_seq_positions = np.zeros((batch_size, max_seq_length), dtype=np.int64)
+    batch_seq_lengths = np.zeros(batch_size, dtype=np.int64)
+    
+    for i, user in enumerate(batch_users):
+        if user in user_sequences:
+            seq = user_sequences[user]
+            seq_len = min(len(seq), max_seq_length)
+            batch_seq_lengths[i] = seq_len
+            
+            for j in range(seq_len):
+                item_id, timestamp, position = seq[j]
+                batch_seq_items[i, j] = item_id
+                batch_seq_timestamps[i, j] = timestamp
+                batch_seq_positions[i, j] = position
+    
+    return batch_seq_items, batch_seq_timestamps, batch_seq_positions, batch_seq_lengths
+def ctr_eval(args, sess, model, data, user_sequences, batch_size):
+    start = 0
+    auc_list = []
+    f1_list = []
+    while start + batch_size <= data.shape[0]:
+        auc, f1 = model.eval(sess, get_feed_dict(args, model, data, user_sequences, start, start + batch_size, flag=False))
+        auc_list.append(auc)
+        f1_list.append(f1)
+        start += batch_size
+    return float(np.mean(auc_list)), float(np.mean(f1_list))
+# Prepare sequence data for a single user
+def prepare_single_user_sequence(user_id, user_sequences, max_seq_length):
+    """
+    Prepare sequence data for a single user
+    Returns arrays that can be tiled for batch processing
+    """
+    user_seq_items = np.zeros(max_seq_length, dtype=np.int64)
+    user_seq_timestamps = np.zeros(max_seq_length, dtype=np.float32)
+    user_seq_positions = np.zeros(max_seq_length, dtype=np.int64)
+    user_seq_length = 0
+    
+    if user_id in user_sequences:
+        seq = user_sequences[user_id]
+        seq_len = min(len(seq), max_seq_length)
+        user_seq_length = seq_len
+        
+        for j in range(seq_len):
+            item_id, timestamp, position = seq[j]
+            user_seq_items[j] = item_id
+            user_seq_timestamps[j] = timestamp
+            user_seq_positions[j] = position
+    
+    # Return as (1, max_seq_length) arrays for tiling
+    return user_seq_items.reshape(1, -1), user_seq_timestamps.reshape(1, -1), \
+           user_seq_positions.reshape(1, -1), np.array([user_seq_length])
+
+def topk_eval(args, sess, model, user_list, train_record, test_record, item_set, k_list, batch_size):
+    precision_list = {k: [] for k in k_list}
+    recall_list = {k: [] for k in k_list}
+
+    for user in user_list:
+        test_item_list = list(item_set - train_record[user])
+        item_score_map = dict()
+        start = 0
+        
+        # Prepare user sequence data for this user
+        if hasattr(model, 'use_temporal') and model.use_temporal:
+            user_seq_items, user_seq_timestamps, user_seq_positions, user_seq_length = \
+                prepare_single_user_sequence(user, model.user_sequences, model.max_seq_length)
+        
+        while start + batch_size <= len(test_item_list):
+            feed_dict = {
+                model.user_indices: [user] * batch_size,
+                model.item_indices: test_item_list[start:start + batch_size],
+                model.node_dropout: [0.]*len(eval(args.layer_size)),
+                model.mess_dropout: [0.]*len(eval(args.layer_size))
+            }
+            
+            # Add temporal placeholders if needed
+            if hasattr(model, 'use_temporal') and model.use_temporal:
+                feed_dict[model.user_seq_items] = np.tile(user_seq_items, (batch_size, 1))
+                feed_dict[model.user_seq_timestamps] = np.tile(user_seq_timestamps, (batch_size, 1))
+                feed_dict[model.user_seq_positions] = np.tile(user_seq_positions, (batch_size, 1))
+                feed_dict[model.user_seq_length] = np.tile(user_seq_length, batch_size)
+            
+            items, scores = model.get_scores(sess, feed_dict)
+            
+            for item, score in zip(items, scores):
+                item_score_map[item] = score
+            start += batch_size
+
+        # padding the last incomplete minibatch if exists
+        if start < len(test_item_list):
+            feed_dict = {
+                model.user_indices: [user] * batch_size,
+                model.item_indices: test_item_list[start:] + [test_item_list[-1]] * (batch_size - len(test_item_list) + start),
+                model.node_dropout: [0.]*len(eval(args.layer_size)),
+                model.mess_dropout: [0.]*len(eval(args.layer_size))
+            }
+            
+            # Add temporal placeholders if needed
+            if hasattr(model, 'use_temporal') and model.use_temporal:
+                feed_dict[model.user_seq_items] = np.tile(user_seq_items, (batch_size, 1))
+                feed_dict[model.user_seq_timestamps] = np.tile(user_seq_timestamps, (batch_size, 1))
+                feed_dict[model.user_seq_positions] = np.tile(user_seq_positions, (batch_size, 1))
+                feed_dict[model.user_seq_length] = np.tile(user_seq_length, batch_size)
+            
+            items, scores = model.get_scores(sess, feed_dict)
+            
+            for item, score in zip(items, scores):
+                item_score_map[item] = score
+
+        item_score_pair_sorted = sorted(item_score_map.items(), key=lambda x: x[1], reverse=True)
+        item_sorted = [i[0] for i in item_score_pair_sorted]
+
+        for k in k_list:
+            hit_num = len(set(item_sorted[:k]) & test_record[user])
+            precision_list[k].append(hit_num / k)
+            recall_list[k].append(hit_num / len(test_record[user]))
+
+    precision = [np.mean(precision_list[k]) for k in k_list]
+    recall = [np.mean(recall_list[k]) for k in k_list]
+
+    return precision, recall
+
+
+def get_user_record(data, is_train):
+    user_history_dict = dict()
+    for interaction in data:
+        user = interaction[0]
+        item = interaction[1]
+        label = interaction[2]
+        if is_train or label == 1:
+            if user not in user_history_dict:
+                user_history_dict[user] = set()
+            user_history_dict[user].add(item)
+    return user_history_dict
